@@ -1,0 +1,179 @@
+// =====================================
+// 0) Study area
+// =====================================
+var sz = ee.Geometry.Rectangle([113.75, 22.45, 114.65, 22.85]);
+Map.centerObject(sz, 10);
+Map.addLayer(sz, {}, 'Shenzhen ROI');
+
+// =====================================
+// 1) Define your points here
+// Replace coordinates and point_id with your own
+// =====================================
+var points = ee.FeatureCollection([
+  ee.Feature(ee.Geometry.Point([114.02807, 22.57742]), {point_id: 'P1'}),
+  ee.Feature(ee.Geometry.Point([114.03494, 22.63542]), {point_id: 'P2'}),
+  ee.Feature(ee.Geometry.Point([114.05000, 22.56000]), {point_id: 'P3'}),
+  ee.Feature(ee.Geometry.Point([114.06000, 22.57000]), {point_id: 'P4'}),
+  ee.Feature(ee.Geometry.Point([114.07000, 22.58000]), {point_id: 'P5'}),
+  ee.Feature(ee.Geometry.Point([114.08000, 22.59000]), {point_id: 'P6'}),
+  ee.Feature(ee.Geometry.Point([114.09000, 22.60000]), {point_id: 'P7'}),
+  ee.Feature(ee.Geometry.Point([114.10000, 22.61000]), {point_id: 'P8'}),
+  ee.Feature(ee.Geometry.Point([114.11000, 22.62000]), {point_id: 'P9'}),
+  ee.Feature(ee.Geometry.Point([114.12000, 22.63000]), {point_id: 'P10'}),
+  ee.Feature(ee.Geometry.Point([114.13000, 22.64000]), {point_id: 'P11'}),
+  ee.Feature(ee.Geometry.Point([114.14000, 22.65000]), {point_id: 'P12'}),
+  ee.Feature(ee.Geometry.Point([114.15000, 22.66000]), {point_id: 'P13'}),
+  ee.Feature(ee.Geometry.Point([114.16000, 22.67000]), {point_id: 'P14'}),
+  ee.Feature(ee.Geometry.Point([114.17000, 22.68000]), {point_id: 'P15'}),
+  ee.Feature(ee.Geometry.Point([114.18000, 22.69000]), {point_id: 'P16'}),
+  ee.Feature(ee.Geometry.Point([114.19000, 22.70000]), {point_id: 'P17'}),
+  ee.Feature(ee.Geometry.Point([114.20000, 22.71000]), {point_id: 'P18'}),
+  ee.Feature(ee.Geometry.Point([114.21000, 22.72000]), {point_id: 'P19'}),
+  ee.Feature(ee.Geometry.Point([114.22000, 22.73000]), {point_id: 'P20'})
+]);
+
+Map.addLayer(points, {color: 'red'}, 'Sample points');
+
+// =====================================
+// 2) Buffer each point to reduce noise
+// =====================================
+var bufferedPoints = points.map(function(f) {
+  return f.buffer(120).copyProperties(f);
+});
+
+// =====================================
+// 3) Cloud mask + scaling for Landsat 8/9
+// =====================================
+function maskAndScaleLandsat(image) {
+  var qa = image.select('QA_PIXEL');
+
+  var dilatedCloud = 1 << 1;
+  var cirrus       = 1 << 2;
+  var cloud        = 1 << 3;
+  var cloudShadow  = 1 << 4;
+  var snow         = 1 << 5;
+
+  var mask = qa.bitwiseAnd(dilatedCloud).eq(0)
+    .and(qa.bitwiseAnd(cirrus).eq(0))
+    .and(qa.bitwiseAnd(cloud).eq(0))
+    .and(qa.bitwiseAnd(cloudShadow).eq(0))
+    .and(qa.bitwiseAnd(snow).eq(0));
+
+  var optical = image.select([
+    'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7'
+  ]).multiply(0.0000275).add(-0.2);
+
+  return image
+    .addBands(optical, null, true)
+    .updateMask(mask)
+    .copyProperties(image, image.propertyNames());
+}
+
+// =====================================
+// 4) Year list
+// =====================================
+var years = ee.List.sequence(2013, 2025);
+
+// =====================================
+// 5) Annual NDVI image
+// =====================================
+function getAnnualNDVI(year) {
+  year = ee.Number(year);
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end   = ee.Date.fromYMD(year, 12, 31);
+
+  var l8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .filterBounds(sz)
+    .filterDate(start, end)
+    .map(maskAndScaleLandsat);
+
+  var l9 = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+    .filterBounds(sz)
+    .filterDate(start, end)
+    .map(maskAndScaleLandsat);
+
+  return l8.merge(l9)
+    .map(function(img) {
+      return img.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
+    })
+    .mean();
+}
+
+// =====================================
+// 6) Annual LST image
+// =====================================
+function getAnnualLST(year) {
+  year = ee.Number(year);
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end   = ee.Date.fromYMD(year, 12, 31);
+
+  return ee.ImageCollection('MODIS/061/MOD11A2')
+    .filterBounds(sz)
+    .filterDate(start, end)
+    .select('LST_Day_1km')
+    .mean()
+    .multiply(0.02)
+    .subtract(273.15)
+    .rename('LST_C');
+}
+
+// =====================================
+// 7) Extract by point, then by year
+// This order makes each point's years stay together
+// =====================================
+var pointList = bufferedPoints.toList(bufferedPoints.size());
+
+var allData = ee.FeatureCollection(
+  ee.List.sequence(0, bufferedPoints.size().subtract(1)).map(function(i) {
+    var pt = ee.Feature(pointList.get(i));
+    var pointID = pt.get('point_id');
+
+    var yearlyRows = ee.FeatureCollection(
+      years.map(function(y) {
+        y = ee.Number(y);
+
+        var ndviImage = getAnnualNDVI(y);
+        var lstImage = getAnnualLST(y);
+
+        var ndviVal = ndviImage.reduceRegion({
+          reducer: ee.Reducer.mean(),
+          geometry: pt.geometry(),
+          scale: 30,
+          maxPixels: 1e13
+        }).get('NDVI');
+
+        var lstVal = lstImage.reduceRegion({
+          reducer: ee.Reducer.mean(),
+          geometry: pt.geometry(),
+          scale: 1000,
+          maxPixels: 1e13
+        }).get('LST_C');
+
+        return ee.Feature(null, {
+          point_id: pointID,
+          year: y,
+          LST_C: lstVal,
+          NDVI: ndviVal
+        });
+      })
+    );
+
+    return yearlyRows;
+  })
+).flatten();
+
+// =====================================
+// 8) Keep only 4 columns
+// =====================================
+var finalTable = allData.select(['point_id', 'year', 'LST_C', 'NDVI']);
+
+print('Point-year NDVI + LST table', finalTable);
+
+// =====================================
+// 9) Export to CSV
+// =====================================
+Export.table.toDrive({
+  collection: finalTable,
+  description: 'Shenzhen_20Points_LST_NDVI_2013_2025',
+  fileFormat: 'CSV'
+});
