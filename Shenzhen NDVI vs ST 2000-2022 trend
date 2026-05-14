@@ -1,0 +1,152 @@
+// ===============================
+// 1) Study area (Shenzhen ROI)
+// ===============================
+var sz = geometry;
+Map.centerObject(sz, 10);
+Map.addLayer(sz, {}, 'Shenzhen ROI');
+
+// ===============================
+// 2) Year list (2000–2022)
+// ===============================
+var years = ee.List.sequence(2000, 2022);
+
+// ===============================
+// 3) MODIS NDVI cloud/quality mask
+// MOD13Q1 SummaryQA:
+// 0 = Good data
+// 1 = Marginal data
+// 2 = Snow/ice
+// 3 = Cloudy
+// Here we keep 0 and 1
+// ===============================
+function maskMODISNDVI(image) {
+  var qa = image.select('SummaryQA');
+  var mask = qa.lte(1);   // keep good + marginal
+  return image.updateMask(mask);
+}
+
+// ===============================
+// 4) MODIS LST quality mask
+// MOD11A2 QC_Day bits 0-1:
+// 00 = good quality
+// 01 = other quality
+// 10 = TBD
+// 11 = not produced
+// Here we keep only 00 and 01
+// ===============================
+function maskMODISLST(image) {
+  var qc = image.select('QC_Day');
+  var quality = qc.bitwiseAnd(3);   // extract bits 0-1
+  var mask = quality.lte(1);        // keep 0 and 1
+  return image.updateMask(mask);
+}
+
+// ===============================
+// 5) MODIS NDVI (MOD13Q1, 250m, 16-day)
+// NDVI needs scale factor 0.0001
+// ===============================
+function yearlyNDVI(year) {
+  year = ee.Number(year);
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end   = ee.Date.fromYMD(year, 12, 31);
+
+  var ndviImg = ee.ImageCollection('MODIS/061/MOD13Q1')
+    .filterDate(start, end)
+    .filterBounds(sz)
+    .map(maskMODISNDVI)
+    .select('NDVI')
+    .mean()
+    .multiply(0.0001)
+    .rename('NDVI');
+
+  return ndviImg.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: sz,
+    scale: 250,
+    maxPixels: 1e13
+  }).get('NDVI');
+}
+
+// ===============================
+// 6) MODIS LST (MOD11A2, 1km, 8-day)
+// LST needs scale factor 0.02 (Kelvin) then -273.15 to Celsius
+// ===============================
+function yearlyLST(year) {
+  year = ee.Number(year);
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end   = ee.Date.fromYMD(year, 12, 31);
+
+  var lstImg = ee.ImageCollection('MODIS/061/MOD11A2')
+    .filterDate(start, end)
+    .filterBounds(sz)
+    .map(maskMODISLST)
+    .select('LST_Day_1km')
+    .mean()
+    .multiply(0.02)
+    .subtract(273.15)
+    .rename('LST_C');
+
+  return lstImg.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: sz,
+    scale: 1000,
+    maxPixels: 1e13
+  }).get('LST_C');
+}
+
+// ===============================
+// 7) Built-up fraction (NDBI-like proxy)
+// MODIS Land Cover Type (MCD12Q1, yearly)
+// LC_Type1 (IGBP): 13 = Urban and Built-up
+// NOTE: MCD12Q1 starts from 2001 (2000 will be null)
+// ===============================
+function yearlyBuiltFrac(year) {
+  year = ee.Number(year);
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end   = ee.Date.fromYMD(year, 12, 31);
+
+  var lc = ee.ImageCollection('MODIS/061/MCD12Q1')
+    .filterDate(start, end)
+    .first();
+
+  return ee.Algorithms.If(
+    lc,
+    lc.select('LC_Type1')
+      .eq(13)
+      .rename('built_mask')
+      .reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: sz,
+        scale: 500,
+        maxPixels: 1e13
+      })
+      .get('built_mask'),
+    null
+  );
+}
+
+// ===============================
+// 8) Build annual table
+// ===============================
+var table = ee.FeatureCollection(
+  years.map(function(y){
+    y = ee.Number(y);
+    return ee.Feature(null, {
+      year: y,
+      NDVI_mean: yearlyNDVI(y),
+      LST_day_mean_C: yearlyLST(y),
+      Built_frac: yearlyBuiltFrac(y)
+    });
+  })
+);
+
+print('Annual NDVI + LST + Built_frac (2000–2022)', table);
+
+// ===============================
+// 9) Export to CSV
+// ===============================
+Export.table.toDrive({
+  collection: table,
+  description: 'Shenzhen_MODIS_NDVI_LST_BuiltFrac_Annual_2000_2022_masked',
+  fileFormat: 'CSV'
+});
